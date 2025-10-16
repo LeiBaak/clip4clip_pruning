@@ -143,6 +143,9 @@ class LVPruneController(torch.nn.Module):
         self.cum_policy   = None # [B, L] applied to *subsequent* layers
         self.loss_ratio   = 0.0
 
+        # ===== LVPRUNING DEBUG =====
+        self.debug = False
+
     def step(self, layer_i: int, x_LND: torch.Tensor, text_hidden_BLC: torch.Tensor, training: bool):
         """
         x_LND: [L, B, C] (vision tokens with CLS at 0)
@@ -190,10 +193,84 @@ class LVPruneController(torch.nn.Module):
         else:
             self.cum_policy = self.cum_policy * curr
 
+        # ===== LVPRUNING DEBUG: retain grad & snapshot =====
+        if self.debug and LV_DEBUG.on and x_LND.requires_grad:
+            # 记录进入本层前的输入 x（作为本层“被 mask 的K/V来源”形状对齐点）
+            x_LND.retain_grad()
+            # policy: [B,L]，保留给统计用
+            policy_BL = self.cum_policy.detach().clone()
+            # 首次：记录头参数名（用于打印有序结果）
+            if not LV_DEBUG.param_names:
+                for s, head in zip(self.layers, self.heads):
+                    for name, p in head.named_parameters():
+                        LV_DEBUG.param_names.append(f"head{self.layers.index(s)}.{name}")
+                        break  # 只需要占位一次即可
+            # 保存本层条目
+            LV_DEBUG.rec[layer_i] = {
+                "x": x_LND,                      # [L,B,C], 已 retain_grad
+                "policy_BL": policy_BL,          # [B,L]
+                "param_before": [p.detach().clone() for p in self.heads[self.layers.index(layer_i)].parameters()]
+            }
+
         # cache per-layer (optional diagnostics)
         self.layer2policy[layer_i] = self.cum_policy.detach()
 
         return self.cum_policy  # [B,L]
+    
+    # ===== LVPRUNING DEBUG: helpers =====
+    def debug_enable(self, on=True):
+        self.debug = on
+        LV_DEBUG.enable(on)
+        if on:
+            LV_DEBUG.reset()
+
+    @torch.no_grad()
+    def debug_report(self):
+        if not (self.debug and LV_DEBUG.on):
+            return {}
+        report = {}
+        for li, entry in LV_DEBUG.rec.items():
+            x = entry["x"]                # [L,B,C], has .grad
+            pol = entry["policy_BL"]      # [B,L]
+            if x.grad is None:
+                # 说明 backward 没到或被关闭
+                kept_grad_mean = drop_grad_mean = 0.0
+                kept_cnt = drop_cnt = 0
+            else:
+                # 按 token 维统计梯度范数
+                g = x.grad                 # [L,B,C]
+                g_norm = g.pow(2).sum(-1).sqrt()   # [L,B]
+                g_norm_BL = g_norm.permute(1,0)    # [B,L]
+                kept_mask = (pol > 0.5)
+                drop_mask = ~kept_mask
+                # 避免除 0
+                kept_cnt = kept_mask.sum().item()
+                drop_cnt = drop_mask.sum().item()
+                kept_grad_mean = (g_norm_BL[kept_mask].mean().item() if kept_cnt > 0 else 0.0)
+                drop_grad_mean = (g_norm_BL[drop_mask].mean().item() if drop_cnt > 0 else 0.0)
+
+            # 头参数梯度范数
+            head = self.heads[self.layers.index(li)]
+            p_grad_norm = 0.0
+            has_grad = False
+            for p in head.parameters():
+                if p.grad is not None:
+                    has_grad = True
+                    p_grad_norm += p.grad.data.float().norm().item()
+            # 参数是否真的更新（需要在 optimizer.step() 后再调这个函数）
+            changed = []
+            for p_before, p_after in zip(entry["param_before"], head.parameters()):
+                changed.append(float((p_after.detach() - p_before).abs().max().item()))
+            max_update = max(changed) if changed else 0.0
+
+            report[li] = {
+                "kept_cnt": kept_cnt, "drop_cnt": drop_cnt,
+                "kept_grad_mean": kept_grad_mean,
+                "drop_grad_mean": drop_grad_mean,
+                "head_grad_norm_sum": (p_grad_norm if has_grad else 0.0),
+                "param_max_update": max_update,
+            }
+        return report
 
 class Bottleneck(nn.Module):
     expansion = 4

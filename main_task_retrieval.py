@@ -263,6 +263,13 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
             batch = tuple(t.to(device=device, non_blocking=True) for t in batch)
 
         input_ids, input_mask, segment_ids, video, video_mask = batch
+
+        # ===== LVPRUNING DEBUG: per-iteration toggles =====
+        ctrl = None
+        if hasattr(model, "lvprune_cfg") and model.lvprune_cfg is not None:
+            ctrl = model.lvprune_cfg["controller"]
+            ctrl.debug_enable(True)   # 打开一次即可；想临时抽查就隔一段打开
+
         loss = model(input_ids, segment_ids, input_mask, video, video_mask)
 
         if n_gpu > 1:
@@ -281,6 +288,19 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
                 scheduler.step()  # Update learning rate schedule
 
             optimizer.step()
+            
+            # ===== LVPRUNING DEBUG: print the per-layer stats after step =====
+            if ctrl is not None and ctrl.debug:
+                rep = ctrl.debug_report()
+                if rep:
+                    # 精简打印（也可以写到 TensorBoard / logger）
+                    for li in sorted(rep.keys()):
+                        r = rep[li]
+                        print(f"[LVDBG] layer={li:02d} kept={r['kept_cnt']} drop={r['drop_cnt']}  "
+                            f"grad_kept={r['kept_grad_mean']:.4e} grad_drop={r['drop_grad_mean']:.4e}  "
+                            f"head_grad_norm={r['head_grad_norm_sum']:.4e}  "
+                            f"param_max_update={r['param_max_update']:.4e}")
+                            
             optimizer.zero_grad()
 
             # https://github.com/openai/CLIP/issues/46
