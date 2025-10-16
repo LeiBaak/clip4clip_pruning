@@ -68,6 +68,132 @@ def available_models():
     return list(_MODELS.keys())
 
 # =============================
+# ===== LVPRUNING MODS: utils =====
+import math
+from typing import Optional, List
+
+def gumbel_softmax_sample(logits: torch.Tensor, tau: float, eps: float = 1e-20):
+    U = torch.rand_like(logits)
+    g = -torch.log(-torch.log(U + eps) + eps)
+    y = (logits + g) / max(tau, 1e-6)
+    return torch.softmax(y, dim=-1)
+
+def straight_through_hard_sample(probs: torch.Tensor):
+    # probs: (..., 2)  -> hard one-hot with STE
+    idx = probs.argmax(dim=-1, keepdim=True)
+    hard = torch.zeros_like(probs).scatter_(-1, idx, 1.0)
+    return hard + (probs - probs.detach())
+
+class LVDecisionModule(torch.nn.Module):
+    """
+    language-guided pruning head:
+      Q: vision tokens at this layer (exclude [CLS])
+      K,V: text tokens (full-length)
+    logit -> 2-class (drop/keep)
+    """
+    def __init__(self, d_model: int, n_head: int):
+        super().__init__()
+        self.q_proj = torch.nn.Linear(d_model, d_model)
+        self.k_proj = torch.nn.Linear(d_model, d_model)
+        self.v_proj = torch.nn.Linear(d_model, d_model)
+        self.n_head = n_head
+        self.d_head = d_model // n_head
+        self.out_mlp = torch.nn.Sequential(
+            torch.nn.Linear(d_model, d_model),
+            QuickGELU(),
+            torch.nn.Linear(d_model, 2)  # [drop, keep]
+        )
+
+    def forward(self, vis_tokens: torch.Tensor, text_tokens: torch.Tensor):
+        """
+        vis_tokens: [B, Nv, C] (exclude cls)
+        text_tokens: [B, Lt, C]
+        return: logits [B, Nv, 2]
+        """
+        B, Nv, C = vis_tokens.shape
+        Lt = text_tokens.shape[1]
+
+        q = self.q_proj(vis_tokens).view(B, Nv, self.n_head, self.d_head).transpose(1, 2)    # [B,H,Nv,Dh]
+        k = self.k_proj(text_tokens).view(B, Lt, self.n_head, self.d_head).transpose(1, 2)   # [B,H,Lt,Dh]
+        v = self.v_proj(text_tokens).view(B, Lt, self.n_head, self.d_head).transpose(1, 2)   # [B,H,Lt,Dh]
+
+        attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_head)                             # [B,H,Nv,Lt]
+        attn = torch.softmax(attn, dim=-1)
+        ctx  = attn @ v                                                                      # [B,H,Nv,Dh]
+        ctx  = ctx.transpose(1, 2).contiguous().view(B, Nv, C)                               # [B,Nv,C]
+
+        fused = ctx + vis_tokens                                                             # residual
+        logits = self.out_mlp(fused)                                                         # [B,Nv,2]
+        return logits
+
+class LVPruneController(torch.nn.Module):
+    """
+    Manage multi-layer pruning: accumulate policy and provide L_ratio.
+    """
+    def __init__(self, d_model: int, n_head: int, prune_layers: List[int], keep_ratios: List[float], tau: float = 1.0):
+        assert len(prune_layers) == len(keep_ratios)
+        super().__init__()
+        self.layers = prune_layers
+        self.keep_ratios = keep_ratios
+        self.tau = tau
+        self.heads = torch.nn.ModuleList([LVDecisionModule(d_model, n_head) for _ in prune_layers])
+
+        # runtime states
+        self.layer2policy = {}   # layer_idx -> [B, L] (including CLS at index 0)
+        self.cum_policy   = None # [B, L] applied to *subsequent* layers
+        self.loss_ratio   = 0.0
+
+    def step(self, layer_i: int, x_LND: torch.Tensor, text_hidden_BLC: torch.Tensor, training: bool):
+        """
+        x_LND: [L, B, C] (vision tokens with CLS at 0)
+        text_hidden_BLC: [B, Lt, C] (projected by CLIP text head, see encode_text(return_hidden=True))
+        returns current cumulative policy [L,B] for applying in later blocks (LND broadcast)
+        """
+        if layer_i not in self.layers:
+            return self.cum_policy
+
+        B = x_LND.size(1)
+        L = x_LND.size(0)
+
+        # split CLS + patches
+        vis_all_NLC = x_LND.permute(1,0,2)   # [B,L,C]
+        vis_cls = vis_all_NLC[:, :1, :]
+        vis_tok = vis_all_NLC[:, 1:, :]
+
+        head = self.heads[self.layers.index(layer_i)]
+        logits = head(vis_tok, text_hidden_BLC)              # [B,L-1,2]
+
+        if training:
+            probs = gumbel_softmax_sample(logits, self.tau)  # [B,L-1,2]
+            hard  = straight_through_hard_sample(probs)      # STE
+            keep_prob = probs[..., 1]
+            keep_bin  = hard[..., 1]                         # {0,1}
+
+            # ratio regularizer (match avg keep to target p_l)
+            target = self.keep_ratios[self.layers.index(layer_i)]
+            keep_avg = keep_prob.mean()
+            self.loss_ratio = self.loss_ratio + (keep_avg - target) ** 2
+
+            curr = torch.cat([torch.ones(B,1, device=x_LND.device, dtype=keep_bin.dtype), keep_bin], dim=1)  # add CLS keep=1
+        else:
+            # eval: top-k by keep-logit
+            k = max(1, int(round(self.keep_ratios[self.layers.index(layer_i)] * (L-1))))
+            scores = logits[..., 1]                      # [B,L-1]
+            topk_idx = scores.topk(k, dim=-1).indices
+            curr = torch.zeros(B, L-1, device=x_LND.device, dtype=x_LND.dtype)
+            curr.scatter_(1, topk_idx, 1.0)
+            curr = torch.cat([torch.ones(B,1, device=x_LND.device, dtype=curr.dtype), curr], dim=1)
+
+        # accumulate with previous policy (progressive pruning)
+        if self.cum_policy is None:
+            self.cum_policy = curr  # [B,L]
+        else:
+            self.cum_policy = self.cum_policy * curr
+
+        # cache per-layer (optional diagnostics)
+        self.layer2policy[layer_i] = self.cum_policy.detach()
+
+        return self.cum_policy  # [B,L]
 
 class Bottleneck(nn.Module):
     expansion = 4
@@ -240,19 +366,33 @@ class ResidualAttentionBlock(nn.Module):
         self.ln_2 = LayerNorm(d_model)
         self.attn_mask = attn_mask
 
-    def attention(self, x: torch.Tensor):
+    def attention(self, x: torch.Tensor, policy_LB: torch.Tensor = None):
         attn_mask_ = self.attn_mask
         if self.attn_mask is not None and hasattr(self.attn_mask, '__call__'):
             attn_mask_ = self.attn_mask(x.size(0))   # LND
+        
+        # 默认：不屏蔽任何 key
+        key_padding_mask = None
+        if policy_LB is not None:
+            # policy_LB: [L, B] -> [B, L]；True 表示“屏蔽/丢弃”
+            key_keep_BL = policy_LB.transpose(0, 1).contiguous()    # [B, L], 1=keep, 0=drop
+            key_padding_mask = (key_keep_BL < 0.5)                  # bool [B, L], True=mask(drop)
+
 
         attn_mask_ = attn_mask_.to(dtype=x.dtype, device=x.device) if attn_mask_ is not None else None
-        return self.attn(x, x, x, need_weights=False, attn_mask=attn_mask_)[0]
+        return self.attn(x, x, x, need_weights=False, attn_mask=attn_mask_, key_padding_mask=key_padding_mask)[0]
 
-    def forward(self, x_tuple:tuple):
-        x, video_frame = x_tuple
-        x = x + self.attention(self.ln_1(x))
+    def forward(self, x_tuple: tuple):
+        # x_tuple can be (x, video_frame) or (x, video_frame, policy_LB)
+        if len(x_tuple) == 2:
+            x, video_frame = x_tuple
+            policy_LB = None
+        else:
+            x, video_frame, policy_LB = x_tuple  # policy over tokens for each sample
+
+        x = x + self.attention(self.ln_1(x), policy_LB=policy_LB)  # masked attention if provided
         x = x + self.mlp(self.ln_2(x))
-        return (x, video_frame)
+        return (x, video_frame, policy_LB)
 
 
 class Transformer(nn.Module):
@@ -262,9 +402,12 @@ class Transformer(nn.Module):
         self.layers = layers
         self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
 
-    def forward(self, x: torch.Tensor, video_frame=-1):
-        return self.resblocks((x, video_frame))[0]
-
+    def forward(self, x: torch.Tensor, video_frame=-1, policy_LB: Optional[torch.Tensor] = None):
+        out = (x, video_frame, policy_LB)
+        for blk in self.resblocks:
+            out = blk(out)
+        x, _, policy_LB = out
+        return x
 
 class VisualTransformer(nn.Module):
     def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int,
@@ -292,7 +435,7 @@ class VisualTransformer(nn.Module):
             self.conv2 = nn.Conv3d(in_channels=3, out_channels=width, kernel_size=(3, patch_size, patch_size),
                                    stride=(1, patch_size, patch_size), padding=(1, 0, 0), bias=False)
 
-    def forward(self, x: torch.Tensor, video_frame=-1):
+    def forward(self, x: torch.Tensor, video_frame=-1, lvprune_cfg: Optional[dict] = None):
 
         if self.linear_patch == '3d':
             assert video_frame != -1
@@ -311,7 +454,19 @@ class VisualTransformer(nn.Module):
         x = self.ln_pre(x)
 
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x, video_frame=video_frame)
+        if lvprune_cfg is None:
+            x = self.transformer(x, video_frame=video_frame)
+        else:
+            ctrl: LVPruneController = lvprune_cfg["controller"]
+            text_hidden = lvprune_cfg["text_hidden"]                 # [B,Lt,C]
+            prune_set = set(ctrl.layers)
+
+            policy_LB = None  # [L,B]
+            for li, blk in enumerate(self.transformer.resblocks):
+                if li in prune_set:
+                    policy_B_L = ctrl.step(li, x, text_hidden, training=self.training)  # [B,L]
+                    policy_LB = policy_B_L.transpose(0, 1).contiguous()                 # [L,B]
+                x, _, policy_LB = blk((x, video_frame, policy_LB))
         x = x.permute(1, 0, 2)  # LND -> NLD
 
         # Move the three lines below to `encode_image` for entire hidden sequence
@@ -447,8 +602,8 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def encode_image(self, image, return_hidden=False, video_frame=-1):
-        hidden = self.visual(image.type(self.dtype), video_frame=video_frame)
+    def encode_image(self, image, return_hidden=False, video_frame=-1, lvprune_cfg: Optional[dict] = None):
+        hidden = self.visual(image.type(self.dtype), video_frame=video_frame, lvprune_cfg=lvprune_cfg)
         hidden = self.visual.ln_post(hidden) @ self.visual.proj
 
         x = hidden[:, 0, :]

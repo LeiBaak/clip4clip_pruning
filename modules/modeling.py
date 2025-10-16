@@ -245,6 +245,14 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         self.loss_fct = CrossEn()
 
         self.apply(self.init_weights)
+        # ===== LVPRUNING MODS: config & controller =====
+        lv_layers = getattr(self, "lv_layers", None) or [2, 5, 8]
+        lv_keep   = getattr(self, "lv_keep",   None) or [0.5, 0.25, 0.125]
+        lv_tau    = getattr(self, "lv_tau",    None) or 1.0
+
+        d_model = self.clip.visual.transformer.width
+        n_head  = self.clip.visual.transformer.resblocks[0].attn.num_heads
+        self.lv_controller = LVPruneController(d_model, n_head, lv_layers, lv_keep, tau=lv_tau)
 
     def forward(self, input_ids, token_type_ids, attention_mask, video, video_mask=None):
         input_ids = input_ids.view(-1, input_ids.shape[-1])
@@ -269,6 +277,9 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             sim_loss2 = self.loss_fct(sim_matrix.T)
             sim_loss = (sim_loss1 + sim_loss2) / 2
             loss += sim_loss
+            
+            if hasattr(self, "lv_controller") and self.lv_controller is not None:
+                loss = loss + 0.1 * self.lv_controller.loss_ratio
 
             return loss
         else:
@@ -312,8 +323,18 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             video = video.view(b * pair * bs * ts, channel, h, w)
             video_frame = bs * ts
 
-        sequence_output = self.get_sequence_output(input_ids, token_type_ids, attention_mask, shaped=True)
-        visual_output = self.get_visual_output(video, video_mask, shaped=True, video_frame=video_frame)
+        text_pooled, text_hidden = self.clip.encode_text(input_ids, return_hidden=True)  # [B, C], [B, Lt, C]
+        sequence_output = text_pooled.view(-1, 1, text_pooled.size(-1))
+
+        ctrl = getattr(self, "lv_controller", None)
+        if ctrl is not None:
+            ctrl.loss_ratio = 0.0  # reset per forward
+            lv_cfg = {"controller": ctrl, "text_hidden": text_hidden}
+        else:
+            lv_cfg = None
+            
+        visual_hidden_full = self.clip.encode_image(x_img, video_frame=video_frame, lvprune_cfg=lv_cfg).float()
+        visual_output = visual_hidden_full.view(-1, visual_hidden_full.size(1), visual_hidden_full.size(-1))  # [B, S_v, C]
 
         return sequence_output, visual_output
 
