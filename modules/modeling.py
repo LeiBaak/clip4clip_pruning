@@ -13,6 +13,8 @@ from modules.module_cross import CrossModel, CrossConfig, Transformer as Transfo
 from modules.module_clip import CLIP, convert_weights
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
 
+from modules.module_clip import LVPruneController
+
 logger = logging.getLogger(__name__)
 allgather = AllGather.apply
 
@@ -243,6 +245,14 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
                                        batch_first=True, bidirectional=False, num_layers=1)
 
         self.loss_fct = CrossEn()
+        # === LVCHK: loss 比例监测 ===
+        self.lv_weight = getattr(self.task_config, "lv_weight", 0.1)  # 原来你是 0.1
+        self._lvchk = {
+            "sim_loss": None,
+            "lv_ratio_loss": None,
+            "total": None,
+            "ratio_percent": None,   # lv_ratio_loss / sim_loss（百分比）
+        }
 
         self.apply(self.init_weights)
         # ===== LVPRUNING MODS: config & controller =====
@@ -252,7 +262,15 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
 
         d_model = self.clip.visual.transformer.width
         n_head  = self.clip.visual.transformer.resblocks[0].attn.num_heads
-        self.lv_controller = LVPruneController(d_model, n_head, lv_layers, lv_keep, tau=lv_tau)
+
+        vis_dim = self.clip.visual.transformer.width                     # 视觉 ViT 宽度（多为 768）
+        n_head  = self.clip.visual.transformer.resblocks[0].attn.num_heads
+        txt_dim = self.clip.text_projection.shape[1]
+
+        self.lv_controller = LVPruneController(vis_dim=vis_dim, txt_dim=txt_dim, n_head=n_head, prune_layers=lv_layers, keep_ratios=lv_keep, tau=lv_tau)
+
+        for blk in self.clip.visual.transformer.resblocks:
+            setattr(blk, "_lv_controller_ref", self.lv_controller)
 
     def forward(self, input_ids, token_type_ids, attention_mask, video, video_mask=None):
         input_ids = input_ids.view(-1, input_ids.shape[-1])
@@ -278,8 +296,23 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             sim_loss = (sim_loss1 + sim_loss2) / 2
             loss += sim_loss
             
+            lv_ratio_loss = None
             if hasattr(self, "lv_controller") and self.lv_controller is not None:
-                loss = loss + 0.1 * self.lv_controller.loss_ratio
+                lv_ratio_loss = self.lv_controller.loss_ratio
+                loss = loss + self.lv_weight * lv_ratio_loss
+                
+                # === LVCHK: 缓存监测量（给训练脚本打印用） ===
+                with torch.no_grad():
+                    sim = float(sim_loss.detach().cpu())
+                    lv  = float((lv_ratio_loss.detach() if lv_ratio_loss is not None else torch.tensor(0.)).cpu())
+                    eps = 1e-12
+                    ratio_percent = (self.lv_weight * lv) / (sim + eps) * 100.0  # “比例项 / 主对比损失”的百分比
+                    self._lvchk.update({
+                        "sim_loss": sim,
+                        "lv_ratio_loss": lv,
+                        "total": float(loss.detach().cpu()),
+                        "ratio_percent": float(ratio_percent),
+                    })
 
             return loss
         else:
@@ -324,17 +357,18 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             video_frame = bs * ts
 
         text_pooled, text_hidden = self.clip.encode_text(input_ids, return_hidden=True)  # [B, C], [B, Lt, C]
-        sequence_output = text_pooled.view(-1, 1, text_pooled.size(-1))
+        sequence_output = text_pooled.view(-1, 1, text_pooled.size(-1)).float()
 
         ctrl = getattr(self, "lv_controller", None)
         if ctrl is not None:
             ctrl.loss_ratio = 0.0  # reset per forward
-            lv_cfg = {"controller": ctrl, "text_hidden": text_hidden}
+            text_hidden_for_vis = text_hidden.repeat_interleave(video_frame, dim=0)
+            lv_cfg = {"controller": ctrl, "text_hidden": text_hidden_for_vis}
         else:
             lv_cfg = None
             
-        visual_hidden_full = self.clip.encode_image(x_img, video_frame=video_frame, lvprune_cfg=lv_cfg).float()
-        visual_output = visual_hidden_full.view(-1, visual_hidden_full.size(1), visual_hidden_full.size(-1))  # [B, S_v, C]
+        visual_hidden_full = self.clip.encode_image(video, video_frame=video_frame, lvprune_cfg=lv_cfg).float()
+        visual_output = visual_hidden_full.view(input_ids.size(0), video_frame, visual_hidden_full.size(-1))  # [B, S_v, C]
 
         return sequence_output, visual_output
 

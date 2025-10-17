@@ -22,6 +22,181 @@ torch.distributed.init_process_group(backend="nccl")
 
 global logger
 
+import torch.nn as nn
+import torch.distributed as dist
+
+from modules import module_clip as lvmod
+
+# ====== LV runtime check ======
+import os, torch, itertools
+
+def _find_lv_controller(model: torch.nn.Module):
+    for name, m in model.named_modules():
+        if name.endswith("lv_controller") or m.__class__.__name__.lower().startswith("lvprunecontroller"):
+            return m
+    return None
+
+@torch.no_grad()
+def lv_runtime_check(model, optimizer, note="", print_policy_cls=True):
+    """
+    打印：
+      - controller是否在模型树里
+      - head0是否进optimizer & lr
+      - head0参数dtype
+      - 最近一次策略快照是否存在（以及CLS是否=1）
+      - attention是否走了fp32构造路径（需要在attention里打一行标志，见下文补丁）
+    """
+    # 只在 rank0 打印（多卡避免重复）
+    rank = int(os.environ.get("RANK", "0"))
+    if rank != 0:
+        return
+
+    ctrl = _find_lv_controller(model)
+    print(f"[CHK][{note}] ctrl_found:", ctrl is not None, f"type={type(ctrl).__name__ if ctrl else None}")
+
+    if ctrl is None:
+        return
+
+    # 1) head0 是否在 optimizer 里 & 对应 lr（去重）
+    h0_params = {id(p) for p in ctrl.heads[0].parameters()}
+    hit_lrs = set()
+    in_opt = False
+    for g in optimizer.param_groups:
+        has = any(id(p) in h0_params for p in g['params'])
+        if has:
+            in_opt = True
+            hit_lrs.add(g.get('lr', None))
+    print(f"[CHK][{note}] head0 in optimizer:", in_opt, "lr(s):", sorted(list(hit_lrs)))
+
+    # 2) head0 参数 dtype（是否FP32）
+    dtypes = {p.dtype for p in ctrl.heads[0].parameters()}
+    print(f"[CHK][{note}] head0 param dtypes:", dtypes)
+
+    # 3) 最近策略快照（需要在 controller.step 里保存，见下文补丁）
+    pol = getattr(ctrl, "_last_policy_BL", None)  # [B,L] 1=keep,0=drop
+    if pol is None:
+        print(f"[CHK][{note}] policy snapshot: None  (add: ctrl._last_policy_BL = policy_B_L.detach().clone())")
+    else:
+        B, L = pol.shape
+        info = f"[B={B},L={L}] keep_ratio={float(pol.mean().item()):.3f}"
+        if print_policy_cls and L > 0:
+            info += f"  cls_keep={float(pol[:,0].float().mean().item()):.3f}"
+        print(f"[CHK][{note}] policy snapshot:", info)
+
+    # 4) attention 是否在fp32路径构造掩码（需要在 attention 里打一行标志，见下文补丁）
+    attn_fp32 = getattr(ctrl, "_attn_fp32", None)
+    print(f"[CHK][{note}] attn_fp32:", attn_fp32)
+
+def lv_loss_health_print(model, step, every=50):
+    try:
+        import os, torch
+        rank = int(os.environ.get("RANK", "0"))
+        if rank != 0: 
+            return
+        if step % every != 0:
+            return
+        if not hasattr(model, "_lvchk"):
+            return
+        d = model._lvchk
+        if d["sim_loss"] is None:
+            return
+        sim = d["sim_loss"]; lv = d["lv_ratio_loss"]; tot = d["total"]; rp = d["ratio_percent"]
+        # 经验：比例项一般建议 < 10%（视你期望的剪枝强度而定）
+        warn = "  <-- HIGH" if rp > 10.0 else ""
+        print(f"[LVCHK] step={step:6d}  sim={sim:.4f}  lv_ratio={lv:.4f}  "
+              f"total={tot:.4f}  lv/ sim ={rp:.2f}%{warn}")
+    except Exception as e:
+        # 有异常就静默跳过，不影响训练
+        pass
+
+def _is_rank0():
+    return (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
+
+def _iter_tensors(x):
+    if torch.is_tensor(x):
+        yield x
+    elif isinstance(x, (list, tuple)):
+        for t in x:
+            yield from _iter_tensors(t)
+    elif isinstance(x, dict):
+        for t in x.values():
+            yield from _iter_tensors(t)
+
+def assert_finite(name, *tensors):
+    for t in tensors:
+        for z in _iter_tensors(t):
+            if z is None: 
+                continue
+            if not torch.is_tensor(z):
+                continue
+            if not torch.isfinite(z).all():
+                # 打印最小/最大值帮助定位
+                mn = torch.nan_to_num(z.detach().float(), nan=0.0, posinf=1e9, neginf=-1e9).min().item()
+                mx = torch.nan_to_num(z.detach().float(), nan=0.0, posinf=1e9, neginf=-1e9).max().item()
+                raise RuntimeError(f"[NaNDetect][{name}] non-finite tensor: shape={tuple(z.shape)} "
+                                   f"dtype={z.dtype} min={mn:.4e} max={mx:.4e}")
+
+class NaNDetector:
+    def __init__(self, model: nn.Module, verbose_list=None):
+        self.model = model
+        self.handles = []
+        # 只在这些模块上挂钩，噪声更小；需要更细就加名字前缀
+        self.target_types = (nn.MultiheadAttention, nn.Linear, nn.LayerNorm, nn.Conv2d)
+        self.verbose_list = verbose_list or [
+            "clip.visual.transformer",     # 视觉 Transformer
+            "lv_controller.heads",         # 你的 LV 剪枝头
+            "ResidualAttentionBlock",      # 残差注意力块
+        ]
+
+    def _wants(self, name, module):
+        if isinstance(module, self.target_types):
+            return True
+        return any(s in name for s in self.verbose_list)
+
+    def _fw_hook(self, name):
+        def hook(m, inp, out):
+            if not _is_rank0():
+                return
+            assert_finite(f"FW:{name}", out)
+        return hook
+
+    def _bw_hook(self, name):
+        # backward hook：优先检查 grad_output（自上而下最先出现问题）
+        def hook(m, grad_input, grad_output):
+            if not _is_rank0():
+                return
+            try:
+                assert_finite(f"BW:{name}:grad_out", grad_output)
+            except RuntimeError as e:
+                raise
+        return hook
+
+    def install(self):
+        # 前向整体的异常定位更清晰
+        torch.autograd.set_detect_anomaly(True)
+        for name, module in self.model.named_modules():
+            if self._wants(name, module):
+                self.handles.append(module.register_forward_hook(self._fw_hook(name)))
+                # full_backward_hook 更早拿到 grad_out
+                self.handles.append(module.register_full_backward_hook(self._bw_hook(name)))
+        if _is_rank0():
+            print(f"[NaNDetect] Installed {len(self.handles)} hooks.")
+
+    def remove(self):
+        for h in self.handles:
+            h.remove()
+        self.handles = []
+
+    @torch.no_grad()
+    def check_param_grads(self):
+        # 在 loss.backward() 之后调用，找第一处非有限的 param.grad
+        for n, p in self.model.named_parameters():
+            if p.grad is None:
+                continue
+            if not torch.isfinite(p.grad).all():
+                print(f"[NaNDetect][GRAD] Non-finite grad at param: {n}  shape={tuple(p.grad.shape)}  dtype={p.grad.dtype}")
+                break
+
 def get_args(description='CLIP4Clip on Retrieval Task'):
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--do_pretrain", action='store_true', help="Whether to run training.")
@@ -133,10 +308,11 @@ def set_seed_logger(args):
     torch.backends.cudnn.deterministic = True
 
     world_size = torch.distributed.get_world_size()
-    torch.cuda.set_device(args.local_rank)
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
     args.world_size = world_size
-    rank = torch.distributed.get_rank()
-    args.rank = rank
+    args.rank = local_rank
+    args.local_rank = local_rank
 
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir, exist_ok=True)
@@ -212,7 +388,7 @@ def prep_optimizer(args, model, num_train_optimization_steps, device, n_gpu, loc
                          max_grad_norm=1.0)
 
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank],
-                                                      output_device=local_rank, find_unused_parameters=True)
+                                                      output_device=local_rank, find_unused_parameters=False)
 
     return optimizer, scheduler, model
 
@@ -249,7 +425,7 @@ def load_model(epoch, args, n_gpu, device, model_file=None):
         model = None
     return model
 
-def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, scheduler, global_step, local_rank=0):
+def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, scheduler, global_step, local_rank=0, nandetector = None):
     global logger
     torch.cuda.empty_cache()
     model.train()
@@ -265,10 +441,12 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
         input_ids, input_mask, segment_ids, video, video_mask = batch
 
         # ===== LVPRUNING DEBUG: per-iteration toggles =====
-        ctrl = None
-        if hasattr(model, "lvprune_cfg") and model.lvprune_cfg is not None:
-            ctrl = model.lvprune_cfg["controller"]
-            ctrl.debug_enable(True)   # 打开一次即可；想临时抽查就隔一段打开
+        ctrl = _find_lv_controller(model)
+        if ctrl is not None:
+            ctrl.debug_enable(True)   # 打开/保持调试
+        else:
+            # 没拿到也不影响训练，但就不会有 LVDBG 打印
+            pass
 
         loss = model(input_ids, segment_ids, input_mask, video, video_mask)
 
@@ -277,7 +455,9 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
         if args.gradient_accumulation_steps > 1:
             loss = loss / args.gradient_accumulation_steps
 
+        assert_finite("LOSS", loss)
         loss.backward()
+        # nandetector.check_param_grads()
 
         total_loss += float(loss)
         if (step + 1) % args.gradient_accumulation_steps == 0:
@@ -288,6 +468,23 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
                 scheduler.step()  # Update learning rate schedule
 
             optimizer.step()
+            
+            # 真实学习率
+            lr_vals = [pg['lr'] for pg in optimizer.param_groups]
+            print(f"[STAT] step={global_step} lr={','.join(f'{v:.6g}' for v in lr_vals)}")
+
+            # AMP 是否在跳步（梯度溢出导致 scaler 跳过 step）
+            sc = locals().get('scaler', None)
+            if sc is not None:
+                print(f"[STAT] scaler_state= {getattr(sc, '_state', {})}")
+
+            # CLIP 的 logit_scale（温度），是否被钳住 & 是否在学
+            if hasattr(model, 'clip') and hasattr(model.clip, 'logit_scale'):
+                ls = model.clip.logit_scale
+                print(f"[STAT] logit_scale= {float(ls.data):.4f}  exp(logit_scale)={float(ls.data.exp()):.3f}")
+
+            lv_loss_health_print(model.module if hasattr(model, "module") else model, global_step, every=50)
+            lv_runtime_check(model, optimizer, note=f"epoch{epoch}_step{global_step}")
             
             # ===== LVPRUNING DEBUG: print the per-layer stats after step =====
             if ctrl is not None and ctrl.debug:
@@ -489,6 +686,7 @@ def main():
 
     assert  args.task_type == "retrieval"
     model = init_model(args, device, n_gpu, args.local_rank)
+    lvmod.LV_DEBUG.on = False
 
     ## ####################################
     # freeze testing
@@ -569,11 +767,14 @@ def main():
             resumed_epoch = checkpoint['epoch']+1
             resumed_loss = checkpoint['loss']
         
+        # nan_guard = NaNDetector(model)
+        # nan_guard.install()
+
         global_step = 0
         for epoch in range(resumed_epoch, args.epochs):
             train_sampler.set_epoch(epoch)
             tr_loss, global_step = train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer,
-                                               scheduler, global_step, local_rank=args.local_rank)
+                                               scheduler, global_step, local_rank=args.local_rank, nandetector = None)
             if args.local_rank == 0:
                 logger.info("Epoch %d/%s Finished, Train Loss: %f", epoch + 1, args.epochs, tr_loss)
 

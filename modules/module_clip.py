@@ -72,11 +72,41 @@ def available_models():
 import math
 from typing import Optional, List
 
-def gumbel_softmax_sample(logits: torch.Tensor, tau: float, eps: float = 1e-20):
-    U = torch.rand_like(logits)
-    g = -torch.log(-torch.log(U + eps) + eps)
-    y = (logits + g) / max(tau, 1e-6)
-    return torch.softmax(y, dim=-1)
+class _LVDebugRecorder:
+    def __init__(self):
+        self.on = False
+        self.rec = {}          # layer_i -> dict(x, policy_BL, before_params)
+        self.param_names = []  # filled once
+    def reset(self):
+        self.rec.clear()
+    def enable(self, on=True):
+        self.on = on
+
+LV_DEBUG = _LVDebugRecorder()
+
+def gumbel_softmax_sample(logits: torch.Tensor, tau: float, eps: float = 1e-6):
+    # 1) 采样在 fp32，clamp 防 log(0)
+    U = torch.rand_like(logits, dtype=torch.float32).clamp_(eps, 1.0 - eps)
+    g = -torch.log(-torch.log(U))  # fp32
+
+    # 2) logits 升 fp32，并做数值中心化（防溢出）
+    logits32 = logits.to(torch.float32)
+    logits32 = logits32 - logits32.max(dim=-1, keepdim=True).values  # LSE trick
+
+    # 3) tau 设下界（太小极易 NaN）；你可以先从 0.5 起步
+    tau = max(float(tau), 5e-2)
+
+    y = (logits32 + g) / tau
+
+    # 4) softmax 在 fp32，最后再 cast 回原 dtype
+    probs = torch.softmax(y, dim=-1).to(logits.dtype)
+
+    # 5) 一次性检查（如果还有问题，直接抛出更明确的定位）
+    if not torch.isfinite(probs).all():
+        mn = torch.nan_to_num(probs.detach().float(), nan=0., posinf=1e9, neginf=-1e9).min().item()
+        mx = torch.nan_to_num(probs.detach().float(), nan=0., posinf=1e9, neginf=-1e9).max().item()
+        raise RuntimeError(f"[Gumbel] probs non-finite: min={mn:.3e} max={mx:.3e}")
+    return probs
 
 def straight_through_hard_sample(probs: torch.Tensor):
     # probs: (..., 2)  -> hard one-hot with STE
@@ -91,17 +121,19 @@ class LVDecisionModule(torch.nn.Module):
       K,V: text tokens (full-length)
     logit -> 2-class (drop/keep)
     """
-    def __init__(self, d_model: int, n_head: int):
+    def __init__(self, vis_dim: int, txt_dim: int, n_head: int, inner_dim: int=None):
         super().__init__()
-        self.q_proj = torch.nn.Linear(d_model, d_model)
-        self.k_proj = torch.nn.Linear(d_model, d_model)
-        self.v_proj = torch.nn.Linear(d_model, d_model)
+        self.q_proj = nn.Linear(vis_dim, inner_dim)   # Q ← 视觉 768
+        self.k_proj = nn.Linear(txt_dim, inner_dim)   # K ← 文本 512
+        self.v_proj = nn.Linear(txt_dim, inner_dim)   # V ← 文本 512
         self.n_head = n_head
-        self.d_head = d_model // n_head
+        self.inner_dim = inner_dim or vis_dim
+        assert self.inner_dim % n_head == 0, "inner_dim must be divisible by n_head"
+        self.d_head = self.inner_dim // n_head
         self.out_mlp = torch.nn.Sequential(
-            torch.nn.Linear(d_model, d_model),
+            torch.nn.Linear(inner_dim, inner_dim),
             QuickGELU(),
-            torch.nn.Linear(d_model, 2)  # [drop, keep]
+            torch.nn.Linear(inner_dim, 2)  # [drop, keep]
         )
 
     def forward(self, vis_tokens: torch.Tensor, text_tokens: torch.Tensor):
@@ -117,12 +149,12 @@ class LVDecisionModule(torch.nn.Module):
         k = self.k_proj(text_tokens).view(B, Lt, self.n_head, self.d_head).transpose(1, 2)   # [B,H,Lt,Dh]
         v = self.v_proj(text_tokens).view(B, Lt, self.n_head, self.d_head).transpose(1, 2)   # [B,H,Lt,Dh]
 
-        attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_head)                             # [B,H,Nv,Lt]
+        attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_head)                            # [B,H,Nv,Lt]
         attn = torch.softmax(attn, dim=-1)
         ctx  = attn @ v                                                                      # [B,H,Nv,Dh]
-        ctx  = ctx.transpose(1, 2).contiguous().view(B, Nv, C)                               # [B,Nv,C]
+        ctx  = ctx.transpose(1, 2).contiguous().view(B, Nv, self.inner_dim)                  # [B,Nv,C]
 
-        fused = ctx + vis_tokens                                                             # residual
+        fused = ctx + vis_tokens[..., :self.inner_dim]                                       # residual
         logits = self.out_mlp(fused)                                                         # [B,Nv,2]
         return logits
 
@@ -130,13 +162,18 @@ class LVPruneController(torch.nn.Module):
     """
     Manage multi-layer pruning: accumulate policy and provide L_ratio.
     """
-    def __init__(self, d_model: int, n_head: int, prune_layers: List[int], keep_ratios: List[float], tau: float = 1.0):
+    def __init__(self, vis_dim: int, txt_dim: int, n_head: int, prune_layers: List[int], keep_ratios: List[float], tau: float = 1.0):
         assert len(prune_layers) == len(keep_ratios)
         super().__init__()
         self.layers = prune_layers
         self.keep_ratios = keep_ratios
         self.tau = tau
-        self.heads = torch.nn.ModuleList([LVDecisionModule(d_model, n_head) for _ in prune_layers])
+
+        inner_dim = vis_dim
+        assert inner_dim % n_head == 0
+
+        self.heads = torch.nn.ModuleList([LVDecisionModule(vis_dim=vis_dim, txt_dim=txt_dim, n_head=n_head, inner_dim=inner_dim) for _ in prune_layers])
+        # self.heads.half()
 
         # runtime states
         self.layer2policy = {}   # layer_idx -> [B, L] (including CLS at index 0)
@@ -144,7 +181,7 @@ class LVPruneController(torch.nn.Module):
         self.loss_ratio   = 0.0
 
         # ===== LVPRUNING DEBUG =====
-        self.debug = False
+        self.debug = True
 
     def step(self, layer_i: int, x_LND: torch.Tensor, text_hidden_BLC: torch.Tensor, training: bool):
         """
@@ -164,11 +201,19 @@ class LVPruneController(torch.nn.Module):
         vis_tok = vis_all_NLC[:, 1:, :]
 
         head = self.heads[self.layers.index(layer_i)]
-        logits = head(vis_tok, text_hidden_BLC)              # [B,L-1,2]
+        with torch.cuda.amp.autocast(enabled=False):
+            logits = head(vis_tok.float(), text_hidden_BLC.float())
+        if not torch.isfinite(logits).all():
+            raise RuntimeError("[LV][HEAD logits] non-finite")
 
         if training:
             probs = gumbel_softmax_sample(logits, self.tau)  # [B,L-1,2]
+            if not torch.isfinite(probs).all():
+                # 直接报出第几层出问题
+                raise RuntimeError(f"[LV][Gumbel probs] non-finite at layer {layer_i}")
             hard  = straight_through_hard_sample(probs)      # STE
+            if not torch.isfinite(hard).all():
+                raise RuntimeError(f"[LV][hard_st] non-finite at layer {layer_i}")
             keep_prob = probs[..., 1]
             keep_bin  = hard[..., 1]                         # {0,1}
 
@@ -192,7 +237,8 @@ class LVPruneController(torch.nn.Module):
             self.cum_policy = curr  # [B,L]
         else:
             self.cum_policy = self.cum_policy * curr
-
+            
+        self.debug = False
         # ===== LVPRUNING DEBUG: retain grad & snapshot =====
         if self.debug and LV_DEBUG.on and x_LND.requires_grad:
             # 记录进入本层前的输入 x（作为本层“被 mask 的K/V来源”形状对齐点）
@@ -215,6 +261,7 @@ class LVPruneController(torch.nn.Module):
         # cache per-layer (optional diagnostics)
         self.layer2policy[layer_i] = self.cum_policy.detach()
 
+        self._last_policy_BL = self.cum_policy.detach().clone()
         return self.cum_policy  # [B,L]
     
     # ===== LVPRUNING DEBUG: helpers =====
@@ -447,17 +494,59 @@ class ResidualAttentionBlock(nn.Module):
         attn_mask_ = self.attn_mask
         if self.attn_mask is not None and hasattr(self.attn_mask, '__call__'):
             attn_mask_ = self.attn_mask(x.size(0))   # LND
-        
-        # 默认：不屏蔽任何 key
-        key_padding_mask = None
-        if policy_LB is not None:
-            # policy_LB: [L, B] -> [B, L]；True 表示“屏蔽/丢弃”
-            key_keep_BL = policy_LB.transpose(0, 1).contiguous()    # [B, L], 1=keep, 0=drop
-            key_padding_mask = (key_keep_BL < 0.5)                  # bool [B, L], True=mask(drop)
+
+        L, B, C = x.shape
+        H = self.attn.num_heads
+
+        # ===== 训练期 + 有策略：稳定版“加性掩码（STE）” =====
+        if self.training and (policy_LB is not None):
+            L, B, C = x.shape
+            H = self.attn.num_heads
+
+            # 1) policy: [L,B] -> [B,L]，避免in-place写，CLS强制保留
+            key_keep_BL = policy_LB.transpose(0, 1).contiguous()     # [B,L] 0/1(≈)
+            if key_keep_BL.size(1) > 0:
+                key_keep_BL = key_keep_BL.clone()                    # 新叶子张量，安全
+                key_keep_BL[:, 0] = 1.0                              # CLS 永远 keep
+
+            # 2) “前向强惩罚 / 反向小梯度”的可微大负掩码（防回传NaN/爆炸）
+            #    drop = 1 - keep；前向：-M_big * drop；反向：-m_grad * d(drop)
+            M_big  = 1e4   # 前向大负（≈ -inf）
+            m_grad = 10.0  # 反向梯度系数（建议 5~10）
+            drop = (1.0 - key_keep_BL)                               # [B,L]，带梯度
+            mask_1D = (-M_big) * drop.detach() + (-m_grad) * (drop - drop.detach())  # [B,L]
+
+            # 3) 扩到 [B*H, Lk]→[B*H, Lq, Lk]，在 fp32 构造更稳
+            mask_k = mask_1D.unsqueeze(1).repeat(1, H, 1).reshape(B * H, L)          # [B*H, L]
+            add3d  = mask_k.to(torch.float32).unsqueeze(1).repeat(1, L, 1)           # [B*H, L, L]
+
+            # 4) 合并结构性mask（若有），统一 fp32
+            if attn_mask_ is not None:
+                base = attn_mask_.to(dtype=torch.float32, device=x.device)           # [L,L]
+                base = base.unsqueeze(0).unsqueeze(0).expand(B, H, L, L).reshape(B * H, L, L)
+                add3d = add3d + base
+
+            # 5) 安全兜底 & dtype 对齐（MHA要求：bool 或与 query 同dtype）
+            add3d = torch.nan_to_num(add3d, nan=-1e4, posinf=-1e4, neginf=-1e4)
+            add3d = add3d.to(dtype=x.dtype)
+
+            # 6) 调原生 MHA（它会把float mask当作logits偏置加到softmax前），更稳更快
+            ctrl = getattr(self, "_lv_controller_ref", None)
+            if ctrl is not None:
+                ctrl._attn_fp32 = True
+            return self.attn(x, x, x, need_weights=False, attn_mask=add3d)[0]
+
+        else:
+            # 默认：不屏蔽任何 key
+            key_padding_mask = None
+            if policy_LB is not None:
+                # policy_LB: [L, B] -> [B, L]；True 表示“屏蔽/丢弃”
+                key_keep_BL = policy_LB.transpose(0, 1).contiguous()    # [B, L], 1=keep, 0=drop
+                key_padding_mask = (key_keep_BL < 0.5)                  # bool [B, L], True=mask(drop)
 
 
-        attn_mask_ = attn_mask_.to(dtype=x.dtype, device=x.device) if attn_mask_ is not None else None
-        return self.attn(x, x, x, need_weights=False, attn_mask=attn_mask_, key_padding_mask=key_padding_mask)[0]
+            attn_mask_ = attn_mask_.to(dtype=x.dtype, device=x.device) if attn_mask_ is not None else None
+            return self.attn(x, x, x, need_weights=False, attn_mask=attn_mask_, key_padding_mask=key_padding_mask)[0]
 
     def forward(self, x_tuple: tuple):
         # x_tuple can be (x, video_frame) or (x, video_frame, policy_LB)
@@ -535,6 +624,9 @@ class VisualTransformer(nn.Module):
             x = self.transformer(x, video_frame=video_frame)
         else:
             ctrl: LVPruneController = lvprune_cfg["controller"]
+            ctrl.layer2policy.clear()   # ✅ 清空“上一轮的快照”，避免挂旧图
+            ctrl.cum_policy = None      # ✅ 重新从全保留开始累计（当前这轮会重新计算）
+            ctrl.loss_ratio = 0.0       # ✅ 本轮重新累计比例正则
             text_hidden = lvprune_cfg["text_hidden"]                 # [B,Lt,C]
             prune_set = set(ctrl.layers)
 
