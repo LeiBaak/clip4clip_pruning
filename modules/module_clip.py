@@ -156,7 +156,10 @@ class LVDecisionModule(torch.nn.Module):
 
         fused = ctx + vis_tokens[..., :self.inner_dim]                                       # residual
         logits = self.out_mlp(fused)                                                         # [B,Nv,2]
-        return logits
+
+        # === DPP-ATTN: 从现成注意力得到“文本条件相关性” q_i
+        rel_BN = attn.mean(dim=-1).mean(dim=1)
+        return logits, rel_BN  # [B,Nv,2], [B,Nv]
 
 class LVPruneController(torch.nn.Module):
     """
@@ -183,6 +186,14 @@ class LVPruneController(torch.nn.Module):
         # ===== LVPRUNING DEBUG =====
         self.debug = True
 
+        # === DPP-ATTN 正则（轻量）：只用一层线性做核特征
+        self.loss_dpp     = 0.0
+        self.dpp_eps      = 1e-5
+        dpp_dim = 256         # 可按需降到 256/384 节省算力
+        self.dpp_vproj    = nn.Linear(vis_dim, dpp_dim, bias=False)
+        self.dpp_quality_power    = 1.0
+        self.dpp_keepprob_power   = 1.0
+
     def step(self, layer_i: int, x_LND: torch.Tensor, text_hidden_BLC: torch.Tensor, training: bool):
         """
         x_LND: [L, B, C] (vision tokens with CLS at 0)
@@ -202,7 +213,7 @@ class LVPruneController(torch.nn.Module):
 
         head = self.heads[self.layers.index(layer_i)]
         with torch.cuda.amp.autocast(enabled=False):
-            logits = head(vis_tok.float(), text_hidden_BLC.float())
+            logits, rel_BN = head(vis_tok.float(), text_hidden_BLC.float())
         if not torch.isfinite(logits).all():
             raise RuntimeError("[LV][HEAD logits] non-finite")
 
@@ -223,6 +234,13 @@ class LVPruneController(torch.nn.Module):
             self.loss_ratio = self.loss_ratio + (keep_avg - target) ** 2
 
             curr = torch.cat([torch.ones(B,1, device=x_LND.device, dtype=keep_bin.dtype), keep_bin], dim=1)  # add CLS keep=1
+
+            if rel_BN is not None:
+                vis_all_NLC = x_LND.permute(1, 0, 2)
+                vis_tok_BNC = vis_all_NLC[:, 1:, :]
+                keep_prob_BN = probs[..., 1]
+                dpp_loss = self._dpp_from_attn(vis_tok_BNC, keep_prob_BN, rel_BN)
+                self.loss_dpp = self.loss_dpp + dpp_loss
         else:
             # eval: top-k by keep-logit
             k = max(1, int(round(self.keep_ratios[self.layers.index(layer_i)] * (L-1))))
@@ -263,6 +281,71 @@ class LVPruneController(torch.nn.Module):
 
         self._last_policy_BL = self.cum_policy.detach().clone()
         return self.cum_policy  # [B,L]
+    
+    @staticmethod
+    def _safe_logdet_psd(A: torch.Tensor, eps: float) -> torch.Tensor:
+        # A: [B,N,N]，假设 PSD
+        B, N, _ = A.shape
+        I = torch.eye(N, device=A.device, dtype=A.dtype).unsqueeze(0).expand(B, -1, -1)
+        A = A + eps * I
+        L = torch.linalg.cholesky(A.to(torch.float32))
+        logdet = 2.0 * torch.sum(torch.log(torch.diagonal(L, dim1=-2, dim2=-1)), dim=-1)  # [B]
+        return logdet.to(A.dtype)
+    
+    def _dpp_from_attn(self,
+                    vis_tok_BNC: torch.Tensor,   # [B, N, C]  本层视觉 tokens（不含 CLS）
+                    keep_prob_BN: torch.Tensor,  # [B, N]     剪枝头 “保留” 概率
+                    rel_BN: torch.Tensor         # [B, N]     cross-attn 平均得到的相关性
+                    ) -> torch.Tensor:
+        """
+        依据 DPP-Attention：L = (Φ·Diag(q)) (Φ·Diag(q))^T，q_i ~ sqrt(rel_i^γq * kp_i^γk)
+        返回：标量 dpp_loss = - mean_B logdet(•)
+        """
+        # ---------- 质量：相关性 rel ----------
+        eps = 1e-12
+        rel = rel_BN.clamp_min(0.0)                                # 非负
+        rel = rel / (rel.mean(dim=1, keepdim=True) + eps)          # 批内尺度不变
+        if getattr(self, "dpp_quality_power", 1.0) != 1.0:
+            rel = rel.pow(self.dpp_quality_power)                  # γ_q
+
+        # ---------- 保留概率：keep_prob ----------
+        kp = keep_prob_BN.clamp(0.0, 1.0)
+        if getattr(self, "dpp_keepprob_power", 1.0) != 1.0:
+            kp = kp.pow(self.dpp_keepprob_power)                   # γ_k
+
+        # ---------- 软权重：进入核前取 sqrt ----------
+        w = rel * kp                                               # [B, N]
+        w = (w / (w.mean(dim=1, keepdim=True) + eps)).clamp_min(1e-6)
+        w = w.sqrt().unsqueeze(-1)                                 # [B, N, 1]
+
+        # ---------- 多样性特征：线性投影（或 Identity） + L2 归一 ----------
+        with torch.cuda.amp.autocast(enabled=False):               # DPP 分支统一 fp32 更稳
+            phi = self.dpp_vproj(vis_tok_BNC.to(torch.float32))    # [B, N, d]
+            phi = torch.nn.functional.normalize(phi, dim=-1)
+            w32 = w.to(torch.float32)
+
+            # ---------- Gram 核 ----------
+            G = (phi * w32) @ (phi * w32).transpose(1, 2)          # [B, N, N]  PSD, fp32
+
+            # ---------- 可选稳健归一化（默认开启） ----------
+            use_norm = getattr(self, "dpp_use_norm", True)
+            tau = float(getattr(self, "dpp_tau", 1e-2))  # ← 加：温度，默认 1.0
+
+            if use_norm:
+                d = max(1, int(phi.size(-1)))
+                n = max(1, int(G.size(-1)))
+                # 先按 d、N 归一，再按 τ 缩放：G ← G / (d * n * τ)
+                G = G / (float(d) * float(n) * max(tau, 1e-6))   # ← 改：加入 tau
+                A = G + torch.eye(n, device=G.device, dtype=G.dtype).unsqueeze(0)
+                logdet = self._safe_logdet_psd(A, getattr(self, "dpp_eps", 1e-5))  # [B]
+            else:
+                # 即使不用归一化，也可用 τ：A = I + G/τ
+                n = max(1, int(G.size(-1)))
+                A = (G / max(tau, 1e-6)) + torch.eye(n, device=G.device, dtype=G.dtype).unsqueeze(0)
+                logdet = self._safe_logdet_psd(A, getattr(self, "dpp_eps", 1e-5))
+
+        return -logdet.mean()
+
     
     # ===== LVPRUNING DEBUG: helpers =====
     def debug_enable(self, on=True):

@@ -246,7 +246,9 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
 
         self.loss_fct = CrossEn()
         # === LVCHK: loss 比例监测 ===
-        self.lv_weight = getattr(self.task_config, "lv_weight", 0.1)  # 原来你是 0.1
+        self.lv_weight = getattr(self.task_config, "lv_weight", 0.5)  # 原来你是 0.1
+        self.lv_dpp_weight = getattr(self.task_config, "lv_dpp_weight", 0.2)
+
         self._lvchk = {
             "sim_loss": None,
             "lv_ratio_loss": None,
@@ -300,18 +302,25 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             if hasattr(self, "lv_controller") and self.lv_controller is not None:
                 lv_ratio_loss = self.lv_controller.loss_ratio
                 loss = loss + self.lv_weight * lv_ratio_loss
+                # 新增：把 DPP 正则并入
+                if self.lv_dpp_weight > 0:
+                    loss = loss + self.lv_dpp_weight * self.lv_controller.loss_dpp
+
                 
                 # === LVCHK: 缓存监测量（给训练脚本打印用） ===
                 with torch.no_grad():
                     sim = float(sim_loss.detach().cpu())
-                    lv  = float((lv_ratio_loss.detach() if lv_ratio_loss is not None else torch.tensor(0.)).cpu())
+                    lv  = float((self.lv_weight * lv_ratio_loss.detach() if lv_ratio_loss is not None else torch.tensor(0.)).cpu())
                     eps = 1e-12
-                    ratio_percent = (self.lv_weight * lv) / (sim + eps) * 100.0  # “比例项 / 主对比损失”的百分比
+                    ratio_percent = lv / (sim + eps) * 100.0  # “比例项 / 主对比损失”的百分比
+                    dpp_ratio_percent = (self.lv_dpp_weight * float(self.lv_controller.loss_dpp.detach().cpu())) / (sim + eps) * 100.0
                     self._lvchk.update({
                         "sim_loss": sim,
                         "lv_ratio_loss": lv,
                         "total": float(loss.detach().cpu()),
                         "ratio_percent": float(ratio_percent),
+                        "lv_dpp_loss": self.lv_dpp_weight * float(self.lv_controller.loss_dpp.detach().cpu()),
+                        "dpp_ratio_percent": float(dpp_ratio_percent),
                     })
 
             return loss
@@ -362,6 +371,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         ctrl = getattr(self, "lv_controller", None)
         if ctrl is not None:
             ctrl.loss_ratio = 0.0  # reset per forward
+            ctrl.loss_dpp  = 0.0   # 新增：重置 DPP 累积损失
             text_hidden_for_vis = text_hidden.repeat_interleave(video_frame, dim=0)
             lv_cfg = {"controller": ctrl, "text_hidden": text_hidden_for_vis}
         else:

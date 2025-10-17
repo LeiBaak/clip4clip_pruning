@@ -104,6 +104,7 @@ def lv_loss_health_print(model, step, every=50):
         # 经验：比例项一般建议 < 10%（视你期望的剪枝强度而定）
         warn = "  <-- HIGH" if rp > 10.0 else ""
         print(f"[LVCHK] step={step:6d}  sim={sim:.4f}  lv_ratio={lv:.4f}  "
+              f"dpp_loss={d['lv_dpp_loss']:.4f}  dpp_ratio={d['dpp_ratio_percent']:.2f}% "
               f"total={tot:.4f}  lv/ sim ={rp:.2f}%{warn}")
     except Exception as e:
         # 有异常就静默跳过，不影响训练
